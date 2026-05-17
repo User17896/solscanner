@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 # ============================================================
 TELEGRAM_TOKEN = "8739546604:AAE_TY1c9MPXarPrQFLLi1PBMYFdRjaEF_A"
 CHAT_ID        = "5959009671"
-SCAN_INTERVAL  = 300   # 15 minutes in seconds
+SCAN_INTERVAL  = 120   # 15 minutes in seconds
 # ============================================================
 
 # ── NARRATIVE KEYWORDS ───────────────────────────────────────
