@@ -14,21 +14,43 @@ BEST_AVAILABLE_EVERY = 600   # force send best coin every 10 mins if nothing pas
 UPDATE_TIMES         = [600, 1800, 3600]  # reply updates at 10m, 30m, 1hr
 # ============================================================
 
-ALERTED_FILE = "/tmp/alerted_pairs.txt"
+# ── REDIS PERSISTENCE ────────────────────────────────────────
+import redis as redis_lib
+
+REDIS_URL = os.environ.get("REDIS_URL", None)
+redis_client = None
+
+def init_redis():
+    global redis_client
+    if REDIS_URL:
+        try:
+            redis_client = redis_lib.from_url(REDIS_URL, decode_responses=True)
+            redis_client.ping()
+            print("[REDIS] Connected OK")
+        except Exception as e:
+            print(f"[REDIS] Failed: {e}")
+            redis_client = None
+    else:
+        print("[REDIS] No REDIS_URL — in-memory only")
 
 def load_alerted():
-    try:
-        if os.path.exists(ALERTED_FILE):
-            with open(ALERTED_FILE, "r") as f:
-                return set(line.strip() for line in f if line.strip())
-    except: pass
+    if redis_client:
+        try:
+            members = redis_client.smembers("alerted_pairs")
+            print(f"[REDIS] Loaded {len(members)} alerted pairs")
+            return set(members)
+        except Exception as e:
+            print(f"[REDIS] Load error: {e}")
     return set()
 
 def save_alerted(pair_addr):
-    try:
-        with open(ALERTED_FILE, "a") as f:
-            f.write(pair_addr + "\n")
-    except: pass
+    if redis_client:
+        try:
+            redis_client.sadd("alerted_pairs", pair_addr)
+        except Exception as e:
+            print(f"[REDIS] Save error: {e}")
+
+init_redis()
 
 alerted = load_alerted()
 tracked  = {}
