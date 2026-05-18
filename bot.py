@@ -14,9 +14,25 @@ BEST_AVAILABLE_EVERY = 600   # force send best coin every 10 mins if nothing pas
 UPDATE_TIMES         = [600, 1800, 3600]  # reply updates at 10m, 30m, 1hr
 # ============================================================
 
-alerted  = set()
+ALERTED_FILE = "/tmp/alerted_pairs.txt"
+
+def load_alerted():
+    try:
+        if os.path.exists(ALERTED_FILE):
+            with open(ALERTED_FILE, "r") as f:
+                return set(line.strip() for line in f if line.strip())
+    except: pass
+    return set()
+
+def save_alerted(pair_addr):
+    try:
+        with open(ALERTED_FILE, "a") as f:
+            f.write(pair_addr + "\n")
+    except: pass
+
+alerted = load_alerted()
 tracked  = {}
-last_forced_alert = 0  # timestamp of last forced "best available" send
+last_forced_alert = 0
 
 META_CONTEXT = {
     "pepe":   ("🐸 Frog meta",        "PEPE still one of the strongest meme narratives. Frog coins historically run hard in bull cycles."),
@@ -466,6 +482,7 @@ def build_and_send(c, forced=False):
 
     message_id = send_telegram(msg)
     alerted.add(pair_addr)
+    save_alerted(pair_addr)
     if forced:
         last_forced_alert = time.time()
 
@@ -546,6 +563,8 @@ def scan_and_alert():
     # If nothing passed AND it's been 10+ mins since last forced alert → send best available
     if sent == 0:
         time_since_forced = time.time() - last_forced_alert
+        # Only send best available if it scores at least 20 (has some signal)
+        all_candidates = [c for c in all_candidates if c["score"] >= 20]
         if time_since_forced >= BEST_AVAILABLE_EVERY and all_candidates:
             best = all_candidates[0]
             print(f"[FORCED] Sending best available: {best['ticker']} score {best['score']}")
