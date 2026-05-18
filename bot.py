@@ -1,3 +1,4 @@
+# CHAINSCAN v3.1 - age filter 3 days
 import requests
 import time
 import os
@@ -769,6 +770,7 @@ def scan():
 
         mc = pair.get("marketCap", 0) or 0
         if mc > 200_000: continue
+        if age_mins > 4320: continue  # max 3 days old
 
         score, signals, risks, age_str, age_mins, liq_usd, buys, sells = score_dex_pair(pair)
         price_raw = pair.get("priceUsd", "0") or "0"
