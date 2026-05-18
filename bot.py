@@ -607,7 +607,7 @@ def process_pair(pair, source="dex"):
     description= pair.get("_description","")
     image_url  = pair.get("_image", None)
 
-    if pair_addr in alerted: return None\n    # Block by name\n    BLOCKED_NAMES = ["define", "memecoins"]\n    if any(b in name.lower() or b in ticker.lower() for b in BLOCKED_NAMES): return None
+    if pair_addr in alerted: return None
 
     mcap = pair.get("marketCap",0) or pair.get("fdv",0) or 0
     if mcap <= 0: return None
