@@ -768,7 +768,7 @@ def scan():
         if is_blocked(name, ticker):               continue
 
         mc = pair.get("marketCap", 0) or 0
-        if mc > 200_000: continue\n        if age_mins > 4320: continue
+        if mc > 200_000: continue
 
         score, signals, risks, age_str, age_mins, liq_usd, buys, sells = score_dex_pair(pair)
         price_raw = pair.get("priceUsd", "0") or "0"
