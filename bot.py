@@ -7,17 +7,14 @@ from datetime import datetime, timezone
 # ============================================================
 #  CONFIG
 # ============================================================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8739546604:AAE_TY1c9MPXarPrQFLLi1PBMYFdRjaEF_A")
-CHAT_ID        = os.environ.get("CHAT_ID", "5959009671")
-SCAN_INTERVAL        = 120   # 2 mins
-BEST_AVAILABLE_EVERY = 600   # force best coin every 10 mins
-UPDATE_TIMES         = [600, 1800, 3600]  # reply updates at 10m, 30m, 1hr
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "8739546604:AAE_TY1c9MPXarPrQFLLi1PBMYFdRjaEF_A")
+CHAT_ID            = os.environ.get("CHAT_ID", "5959009671")
+SCAN_INTERVAL      = 120
+UPDATE_TIMES       = [600, 1800, 3600]
+MIN_GAIN_FOR_REPLY = 1.5
 
-# MC thresholds
-TYPE1_MAX_MC   = 30_000   # fresh coins under $30K
-TYPE2_MIN_MC   = 50_000   # about to migrate
-TYPE2_MAX_MC   = 69_000   # bonding curve limit
-TYPE3_MAX_MINS = 5        # just migrated - first 5 mins only
+# Blocked token names (permanent garbage)
+BLOCKED = ["define", "memecoins", "test", "scam"]
 # ============================================================
 
 # ── REDIS ────────────────────────────────────────────────────
@@ -34,408 +31,122 @@ def init_redis():
             print("[REDIS] Connected OK")
         except Exception as e:
             print(f"[REDIS] Failed: {e}")
-            redis_client = None
     else:
         print("[REDIS] No REDIS_URL")
 
 def load_alerted():
     if redis_client:
         try:
-            members = redis_client.smembers("alerted_pairs")
-            print(f"[REDIS] Loaded {len(members)} alerted pairs")
-            return set(members)
+            m = redis_client.smembers("alerted_pairs")
+            print(f"[REDIS] Loaded {len(m)} alerted pairs")
+            return set(m)
         except: pass
     return set()
 
-def save_alerted(pair_addr):
+def save_alerted(addr):
     if redis_client:
-        try:
-            redis_client.sadd("alerted_pairs", pair_addr)
+        try: redis_client.sadd("alerted_pairs", addr)
         except: pass
 
 init_redis()
-alerted           = load_alerted()
-tracked           = {}
-last_forced_alert = 0
-
-# ── NARRATIVE KEYWORDS ────────────────────────────────────────
-META_CONTEXT = {
-    "pepe":   ("🐸 Frog meta",        "PEPE still one of the strongest meme narratives. Frog coins historically run hard in bull cycles."),
-    "frog":   ("🐸 Frog meta",        "Frog meta coins consistently outperform. Strong community culture on X."),
-    "wojak":  ("😭 Wojak meta",       "Wojak/feels meta has loyal community. Tends to pump when broader meme season is hot."),
-    "trump":  ("🇺🇸 Political meta",  "Political meme coins explosive right now. High volatility, high upside."),
-    "maga":   ("🇺🇸 Political meta",  "MAGA coins riding political narrative. Fast pumps but watch exit timing."),
-    "elon":   ("⚡ Elon meta",        "Elon-themed coins get viral traction fast. One tweet can 10x these."),
-    "doge":   ("🐶 Doge meta",        "OG meme narrative. Still one of the most recognised meme categories globally."),
-    "ai":     ("🤖 AI meta",          "AI tokens are the hottest narrative in crypto right now."),
-    "agent":  ("🤖 AI Agent meta",    "AI agent tokens exploding. Autonomous treasury mechanics driving speculation."),
-    "gpt":    ("🤖 AI meta",          "GPT-branded tokens ride the AI hype cycle hard. Fast entry, fast exit needed."),
-    "chad":   ("💪 Chad meta",        "Chad/sigma meme culture strong on X. Younger crypto demographic loves this."),
-    "sigma":  ("💪 Sigma meta",       "Sigma meme narrative popular with retail. Viral potential if branding is strong."),
-    "cat":    ("🐱 Cat meta",         "Cat coins had massive runs recently. Strong rival to dog coins."),
-    "dog":    ("🐶 Dog meta",         "Dog meta is evergreen in crypto. Deep retail familiarity drives volume."),
-    "inu":    ("🐶 Inu meta",         "Inu coins have proven track record. SHIB showed the ceiling is very high."),
-    "baby":   ("👶 Baby meta",        "Baby prefix coins often ride parent token narratives."),
-    "moon":   ("🌙 Moon meta",        "Classic crypto branding. Retail friendly narrative."),
-    "based":  ("🔵 Based meta",       "Based culture strong in crypto Twitter."),
-    "bonk":   ("🐶 BONK meta",        "BONK is the OG Solana meme. Strong ecosystem loyalty."),
-    "wif":    ("🐶 WIF meta",         "WIF proved Solana memes can reach billions."),
-    "pump":   ("🚀 Pump meta",        "Pump.fun launched token — native to the hottest Solana launchpad."),
-    "giga":   ("💪 Gigabrain meta",   "Gigabrain/giga culture popular in DeFi circles."),
-    "turbo":  ("⚡ Turbo meta",       "Turbo branding popular for high-energy meme coins."),
-    "ape":    ("🦍 Ape meta",         "Ape culture deeply embedded in crypto."),
-    "bull":   ("🐂 Bull meta",        "Bull meta coins ride market sentiment. Strong in uptrends."),
-    "fire":   ("🔥 Fire meta",        "High energy branding. Viral potential if meme format catches on X."),
-    "king":   ("👑 King meta",        "Royalty branding has proven appeal."),
-    "rich":   ("💰 Wealth meta",      "Aspirational narrative resonates with retail."),
-    "zeus":   ("⚡ Zeus meta",        "Mythology meta gaining traction."),
-    "god":    ("🙏 God meta",         "Bold branding gets attention."),
-    "wojak":  ("😭 Wojak meta",       "Classic crypto meme culture."),
-    "meme":   ("🎭 Meme meta",        "Pure meme coin — success depends entirely on community virality and timing."),
-    "coin":   ("🪙 Generic meme",     "Generic meme coin branding. Needs strong community to stand out."),
-}
-DEFAULT_NARRATIVE = ("🎰 Unclassified", "New token with no established meta. Pure momentum play — timing is everything.")
+alerted         = load_alerted()
+tracked         = {}
+last_alert_time = 0
 
 
 # ── TELEGRAM ─────────────────────────────────────────────────
-def send_telegram(message, reply_to=None):
-    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-    if reply_to:
-        payload["reply_to_message_id"] = reply_to
+def send_photo(image_url, caption):
+    if len(caption) > 1024:
+        caption = caption[:1020] + "..."
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+            json={"chat_id": CHAT_ID, "photo": image_url, "caption": caption, "parse_mode": "HTML"},
+            timeout=15
+        )
         data = r.json()
         if r.ok and data.get("ok"):
             return data["result"]["message_id"]
-        print(f"[TG ERROR] {r.status_code} — {r.text[:200]}")
     except Exception as e:
-        print(f"[TG EXCEPTION] {e}")
+        print(f"[TG PHOTO] {e}")
     return None
 
 
-def send_telegram_photo(image_url, caption, reply_to=None):
-    """Send photo with caption. Falls back to text if image fails."""
-    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    payload = {"chat_id": CHAT_ID, "photo": image_url, "caption": caption, "parse_mode": "HTML"}
+def send_text(msg, reply_to=None):
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     try:
-        r = requests.post(url, json=payload, timeout=15)
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
         data = r.json()
         if r.ok and data.get("ok"):
             return data["result"]["message_id"]
-        # Fall back to text
-        return send_telegram(caption, reply_to=reply_to)
+        print(f"[TG] {r.status_code} {r.text[:100]}")
     except Exception as e:
-        print(f"[TG PHOTO EXCEPTION] {e}")
-        return send_telegram(caption, reply_to=reply_to)
+        print(f"[TG] {e}")
+    return None
 
 
-# ── GAIN UPDATES ─────────────────────────────────────────────
-def fetch_current_data(pair_addr):
+# ── GAIN TRACKING ─────────────────────────────────────────────
+def fetch_current(pair_addr):
     try:
-        r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_addr}",
-            headers={"Accept": "application/json"}, timeout=10
-        )
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_addr}", timeout=10)
         if not r.ok: return None
         pairs = r.json().get("pairs", [])
         if not pairs: return None
         p = pairs[0]
         return {
-            "mcap":     p.get("marketCap", 0) or 0,
-            "price":    p.get("priceUsd",  "0") or "0",
-            "vol_h1":   p.get("volume", {}).get("h1",  0) or 0,
-            "ch_h1":    p.get("priceChange", {}).get("h1",  0) or 0,
-            "buys_h1":  p.get("txns", {}).get("h1", {}).get("buys",  0),
-            "sells_h1": p.get("txns", {}).get("h1", {}).get("sells", 0),
+            "mcap":  p.get("marketCap", 0) or 0,
+            "price": p.get("priceUsd", "0") or "0",
+            "ch_h1": p.get("priceChange", {}).get("h1", 0) or 0,
+            "vol_h1":p.get("volume", {}).get("h1", 0) or 0,
         }
     except: return None
 
 
-def send_gain_update(pair_addr, minutes_elapsed):
+def check_and_reply(pair_addr, mins):
     if pair_addr not in tracked: return
-    t       = tracked[pair_addr]
-    current = fetch_current_data(pair_addr)
-    if not current or current["mcap"] <= 0: return
+    t = tracked[pair_addr]
+    c = fetch_current(pair_addr)
+    if not c or c["mcap"] <= 0: return
 
-    entry_mcap   = t["entry_mcap"]
-    current_mcap = current["mcap"]
-    pct_change   = ((current_mcap - entry_mcap) / entry_mcap * 100) if entry_mcap > 0 else 0
-    multiplier   = (current_mcap / entry_mcap) if entry_mcap > 0 else 1
+    entry = t["entry_mcap"]
+    curr  = c["mcap"]
+    mult  = curr / entry if entry > 0 else 1
 
-    if multiplier >= 5:     perf = "🔥🔥🔥 MASSIVE RUNNER"
-    elif multiplier >= 3:   perf = "🚀🚀 3X+ HIT"
-    elif multiplier >= 2:   perf = "📈📈 2X HIT"
-    elif multiplier >= 1.5: perf = "📈 +50% GAIN"
-    elif multiplier >= 1.1: perf = "🟡 Slight gain"
-    elif multiplier >= 0.8: perf = "🔴 Down from entry"
-    else:                   perf = "💀 Dumped hard"
+    # Only reply if 1.5x or more
+    if mult < MIN_GAIN_FOR_REPLY: return
 
-    try:    price_str = f"${float(current['price']):.8f}"
+    pct = (mult - 1) * 100
+    if mult >= 5:     perf = "🔥🔥🔥 MASSIVE RUNNER"
+    elif mult >= 3:   perf = "🚀🚀 3X HIT"
+    elif mult >= 2:   perf = "📈📈 2X HIT"
+    else:             perf = "📈 1.5X+"
+
+    try:    price_str = f"${float(c['price']):.8f}"
     except: price_str = "N/A"
 
-    total_h1 = current["buys_h1"] + current["sells_h1"]
-    buy_pct  = f"{int(current['buys_h1']/total_h1*100)}%" if total_h1 > 0 else "?"
-
     msg = (
-        f"📊 <b>UPDATE — ${t['ticker']} ({minutes_elapsed} mins)</b>\n"
+        f"📊 <b>UPDATE — ${t['ticker']} ({mins}m)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{perf}\n\n"
-        f"Entry MC:   {fmt(entry_mcap)}\n"
-        f"Current MC: {fmt(current_mcap)}\n"
-        f"Change: {'+' if pct_change>=0 else ''}{pct_change:.0f}% ({multiplier:.2f}x)\n"
-        f"Price: {price_str}\n\n"
-        f"1H: {'+' if current['ch_h1']>=0 else ''}{current['ch_h1']:.0f}% | Vol 1H: {fmt(current['vol_h1'])}\n"
-        f"Buy pressure: {buy_pct}\n"
+        f"Entry: {fmt(entry)} → Now: {fmt(curr)}\n"
+        f"+{pct:.0f}% ({mult:.2f}x) 🚀\n"
+        f"Price: {price_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>NFA — take profit if up, cut if down</i>"
+        f"<i>Take profit or trail stop — NFA</i>"
     )
-    send_telegram(msg, reply_to=t["message_id"])
-    print(f"[UPDATE] {t['ticker']} {minutes_elapsed}min — {multiplier:.2f}x")
+    send_text(msg, reply_to=t["message_id"])
+    print(f"[REPLY] {t['ticker']} {mins}m — {mult:.2f}x")
 
 
 def schedule_updates(pair_addr):
     for delay in UPDATE_TIMES:
         def go(addr=pair_addr, mins=delay//60):
             time.sleep(delay)
-            try:
-                send_gain_update(addr, mins)
-                if addr in tracked:
-                    tracked[addr]["updates_sent"] += 1
-            except Exception as e:
-                print(f"[UPDATE ERROR] {e}")
+            try: check_and_reply(addr, mins)
+            except Exception as e: print(f"[UPDATE ERR] {e}")
         threading.Thread(target=go, daemon=True).start()
-
-
-# ── DATA SOURCES ─────────────────────────────────────────────
-
-def fetch_pumpfun():
-    """Fetch newest coins from pump.fun API."""
-    coins = []
-    try:
-        # New coins
-        r = requests.get(
-            "https://client-api-2-74b1891ee9f9.herokuapp.com/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=true",
-            headers={"Accept": "application/json"}, timeout=15
-        )
-        if r.ok:
-            for coin in r.json():
-                coins.append(("pump", coin))
-        print(f"[PUMP.FUN] Got {len(coins)} coins")
-    except Exception as e:
-        print(f"[PUMP.FUN ERROR] {e}")
-    return coins
-
-
-def fetch_dexscreener():
-    queries = ["solana pump", "new solana meme", "solana meme coin"]
-    pairs   = []
-    seen    = set()
-    for q in queries:
-        try:
-            r = requests.get(
-                f"https://api.dexscreener.com/latest/dex/search/?q={q.replace(' ','+')}",
-                headers={"Accept": "application/json"}, timeout=15
-            )
-            if r.ok:
-                for p in r.json().get("pairs", []):
-                    addr = p.get("pairAddress", "")
-                    if addr and addr not in seen:
-                        seen.add(addr); pairs.append(("dex", p))
-            else:
-                print(f"[DEX] {r.status_code}")
-        except Exception as e:
-            print(f"[DEX ERROR] {e}")
-        time.sleep(0.5)
-    return pairs
-
-
-def fetch_geckoterminal():
-    pairs   = []
-    seen    = set()
-    headers = {"Accept": "application/json;version=20230302"}
-    for url in [
-        "https://api.geckoterminal.com/api/v2/networks/solana/new_pools?page=1",
-        "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools?page=1",
-    ]:
-        try:
-            r = requests.get(url, headers=headers, timeout=15)
-            if not r.ok: continue
-            for pool in r.json().get("data", []):
-                attr = pool.get("attributes", {})
-                addr = pool.get("id", "").replace("solana_", "")
-                if not addr or addr in seen: continue
-                seen.add(addr)
-                base_name = attr.get("name", "").split(" / ")[0]
-                try:    mcap = float(attr.get("market_cap_usd") or 0)
-                except: mcap = 0
-                try:    liq  = float(attr.get("reserve_in_usd") or 0)
-                except: liq  = 0
-                vol = attr.get("volume_usd", {})
-                pch = attr.get("price_change_percentage", {})
-                created_at = attr.get("pool_created_at")
-                created_ts = None
-                if created_at:
-                    try:
-                        dt = datetime.fromisoformat(created_at.replace("Z","+00:00"))
-                        created_ts = int(dt.timestamp()*1000)
-                    except: pass
-                pairs.append(("gecko", {
-                    "chainId": "solana", "pairAddress": addr,
-                    "baseToken": {"symbol": base_name[:10], "name": base_name, "address": ""},
-                    "marketCap": mcap, "liquidity": {"usd": liq},
-                    "volume":    {"h1": float(vol.get("h1",0) or 0), "h24": float(vol.get("h24",0) or 0)},
-                    "priceChange":{"h1": float(pch.get("h1",0) or 0), "h24": float(pch.get("h24",0) or 0)},
-                    "priceUsd":  attr.get("base_token_price_usd","0"),
-                    "pairCreatedAt": created_ts,
-                    "txns": {"h1":{"buys":0,"sells":0},"h24":{"buys":0,"sells":0}},
-                    "info": {},
-                }))
-        except Exception as e:
-            print(f"[GECKO ERROR] {e}")
-        time.sleep(0.5)
-    return pairs
-
-
-# ── NORMALISE PUMP.FUN COIN ───────────────────────────────────
-def normalise_pumpfun(coin):
-    """Convert pump.fun coin format to our standard pair format."""
-    try:
-        mint       = coin.get("mint", "")
-        name       = coin.get("name", "?")
-        symbol     = coin.get("symbol", "?")
-        image_uri  = coin.get("image_uri", None)
-        description= coin.get("description", "")
-        usd_mc     = coin.get("usd_market_cap", 0) or 0
-        created_ts = coin.get("created_timestamp", None)
-
-        # Pump.fun uses virtual_sol_reserves for liquidity estimation
-        virtual_sol = coin.get("virtual_sol_reserves", 0) or 0
-        liq_usd     = (virtual_sol / 1e9) * 170  # approx SOL price
-
-        # Check if complete (migrated to Raydium)
-        complete         = coin.get("complete", False)
-        raydium_pool     = coin.get("raydium_pool", None)
-
-        # Get recent trade info
-        last_trade = coin.get("last_trade_unix_time", None)
-
-        return {
-            "chainId":      "solana",
-            "pairAddress":  mint,
-            "baseToken":    {"symbol": symbol, "name": name, "address": mint},
-            "marketCap":    usd_mc,
-            "liquidity":    {"usd": liq_usd},
-            "volume":       {"h1": 0, "h24": 0},
-            "priceChange":  {"h1": 0, "h24": 0},
-            "priceUsd":     str(coin.get("price", 0) or 0),
-            "pairCreatedAt": created_ts,
-            "txns":         {"h1":{"buys":0,"sells":0},"h24":{"buys":0,"sells":0}},
-            "info":         {},
-            "_image":       image_uri,
-            "_description": description,
-            "_complete":    complete,
-            "_raydium":     raydium_pool,
-            "_source":      "pumpfun",
-            "_last_trade":  last_trade,
-        }
-    except Exception as e:
-        print(f"[NORM ERROR] {e}")
-        return None
-
-
-# ── RUGCHECK ─────────────────────────────────────────────────
-def get_rugcheck(token_address):
-    if not token_address: return {}
-    try:
-        r = requests.get(f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report/summary", timeout=10)
-        if not r.ok: return {}
-        risks = r.json().get("risks",[])
-        mint_ok = freeze_ok = True
-        for risk in risks:
-            n = risk.get("name","").lower(); l = risk.get("level","").lower()
-            if "mint"   in n and l in ["warn","danger"]: mint_ok   = False
-            if "freeze" in n and l == "danger":          freeze_ok = False
-        return {"mint_ok": mint_ok, "freeze_ok": freeze_ok}
-    except: return {}
-
-
-# ── NARRATIVE ────────────────────────────────────────────────
-def get_narrative(name, ticker, description=""):
-    combined = (name+" "+ticker+" "+description).lower()
-    for kw,(label,desc) in META_CONTEXT.items():
-        if kw in combined:
-            runner_str = None
-            try:
-                r = requests.get(
-                    f"https://api.dexscreener.com/latest/dex/search/?q={kw}+solana",
-                    headers={"Accept":"application/json"}, timeout=8
-                )
-                if r.ok:
-                    runners = [p.get("priceChange",{}).get("h24",0) or 0
-                               for p in r.json().get("pairs",[])
-                               if p.get("chainId")=="solana"
-                               and (p.get("priceChange",{}).get("h24",0) or 0) > 50
-                               and (p.get("marketCap",0) or 0) > 5000]
-                    if runners:
-                        runner_str = f"{len(runners)} similar tokens up avg +{sum(runners)/len(runners):.0f}% today 🔥"
-            except: pass
-            return label, desc, runner_str
-    return DEFAULT_NARRATIVE[0], DEFAULT_NARRATIVE[1], None
-
-
-def score_narrative_num(name, ticker, description=""):
-    combined = (name+" "+ticker+" "+description).lower()
-    return 20 if any(kw in combined for kw in META_CONTEXT) else 0
-
-
-# ── SCORING ───────────────────────────────────────────────────
-def score_momentum(pair):
-    score = 0; signals = []
-    h1       = pair.get("txns",{}).get("h1",{})
-    buys_h1  = h1.get("buys",  0)
-    sells_h1 = h1.get("sells", 0)
-    total_h1 = buys_h1 + sells_h1
-    vol_h1   = pair.get("volume",{}).get("h1",0) or 0
-    ch_h1    = pair.get("priceChange",{}).get("h1",0) or 0
-
-    if total_h1 > 0:
-        ratio = buys_h1 / total_h1
-        if ratio >= 0.70:   score += 15; signals.append(f"🟢 Buys {int(ratio*100)}%")
-        elif ratio >= 0.60: score += 10; signals.append(f"🟡 Buys {int(ratio*100)}%")
-        elif ratio >= 0.55: score += 5;  signals.append(f"Buys {int(ratio*100)}%")
-        else:               signals.append(f"🔴 Buys only {int(ratio*100)}%")
-
-    if total_h1 >= 200:   score += 10; signals.append(f"⚡ {total_h1} txns/hr")
-    elif total_h1 >= 100: score += 7;  signals.append(f"⚡ {total_h1} txns/hr")
-    elif total_h1 >= 50:  score += 4;  signals.append(f"{total_h1} txns/hr")
-    elif total_h1 >= 20:  score += 2;  signals.append(f"{total_h1} txns/hr (low)")
-
-    if ch_h1 > 50:    score += 10; signals.append(f"🚀 +{ch_h1:.0f}% 1H")
-    elif ch_h1 > 20:  score += 7;  signals.append(f"📈 +{ch_h1:.0f}% 1H")
-    elif ch_h1 > 0:   score += 3;  signals.append(f"+{ch_h1:.0f}% 1H")
-    elif ch_h1 < -20: score -= 5;  signals.append(f"📉 {ch_h1:.0f}% 1H")
-
-    if vol_h1 > 50000:   score += 10; signals.append(f"💰 ${vol_h1/1000:.0f}K vol/hr")
-    elif vol_h1 > 20000: score += 7;  signals.append(f"💰 ${vol_h1/1000:.0f}K vol/hr")
-    elif vol_h1 > 5000:  score += 4;  signals.append(f"${vol_h1/1000:.0f}K vol/hr")
-
-    return min(score, 35), signals, buys_h1, sells_h1
-
-
-def score_liquidity(pair):
-    liq_usd = pair.get("liquidity",{}).get("usd",0) or 0
-    mcap    = pair.get("marketCap",0) or pair.get("fdv",0) or 1
-    if liq_usd < 1000: return -999, liq_usd
-    ratio = (liq_usd/mcap)*100
-    if ratio >= 25:   score = 25
-    elif ratio >= 15: score = 18
-    elif ratio >= 10: score = 12
-    elif ratio >= 5:  score = 5
-    else:             score = 2
-    return min(score, 25), liq_usd
 
 
 # ── HELPERS ───────────────────────────────────────────────────
@@ -447,338 +158,709 @@ def fmt(n):
     return f"${n:.2f}"
 
 
-def get_age(pair):
-    created = pair.get("pairCreatedAt")
-    if not created: return "Unknown", 9999
+def get_age(created_ts):
+    if not created_ts: return "Unknown", 9999
     try:
-        dt   = datetime.fromtimestamp(created/1000, tz=timezone.utc)
-        mins = int((datetime.now(tz=timezone.utc)-dt).total_seconds()/60)
+        if created_ts > 1e12:
+            dt = datetime.fromtimestamp(created_ts/1000, tz=timezone.utc)
+        else:
+            dt = datetime.fromtimestamp(created_ts, tz=timezone.utc)
+        mins = int((datetime.now(tz=timezone.utc) - dt).total_seconds() / 60)
         return (f"{mins}m", mins) if mins < 60 else (f"{mins//60}h {mins%60}m", mins)
     except: return "Unknown", 9999
 
 
-def check_socials(pair):
-    info = pair.get("info",{})
-    twitter = telegram_link = website = None
-    for s in info.get("socials",[]):
-        t = s.get("type","").lower(); u = s.get("url","")
-        if "twitter" in t or "x.com" in u.lower(): twitter       = u
-        if "telegram" in t:                         telegram_link = u
-    ws = info.get("websites",[])
-    if ws: website = ws[0].get("url")
-    return twitter, telegram_link, website
+def is_blocked(name, ticker):
+    combined = (name + " " + ticker).lower()
+    return any(b in combined for b in BLOCKED)
 
 
-# ── BUILD ALERT MESSAGE ───────────────────────────────────────
-def build_message(c, label, note=""):
-    pair       = c["pair"]
-    score      = c["score"]
-    ticker     = c["ticker"]
-    name       = c["name"]
-    mcap       = c["mcap"]
-    liq_usd    = c["liq_usd"]
-    pair_addr  = c["pair_addr"]
-    token_addr = c["token_addr"]
-    rug        = c["rug"]
-    buys_h1    = c["buys_h1"]
-    sells_h1   = c["sells_h1"]
-    description= c.get("description","")
+# ── DATA SOURCES ─────────────────────────────────────────────
 
-    price = pair.get("priceUsd","0") or "0"
-    try:    price_str = f"${float(price):.8f}"
-    except: price_str = "N/A"
+def fetch_pumpfun_new():
+    """Newest coins from pump.fun sorted by creation time."""
+    coins = []
+    try:
+        r = requests.get(
+            "https://client-api-2-74b1891ee9f9.herokuapp.com/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=true",
+            timeout=15
+        )
+        if r.ok:
+            for c in r.json():
+                coins.append(c)
+            print(f"[PUMP NEW] {len(coins)} coins")
+    except Exception as e:
+        print(f"[PUMP NEW ERR] {e}")
+    return coins
 
-    vol    = pair.get("volume",{})
-    vol_h1 = vol.get("h1",0) or 0; vol_h24 = vol.get("h24",0) or 0
-    ch     = pair.get("priceChange",{})
-    ch_h1  = ch.get("h1",0) or 0;  ch_h24  = ch.get("h24",0) or 0
 
-    liq_pct = f"{(liq_usd/mcap*100):.0f}%" if mcap > 0 else "?"
-    liq_sol = f"{(liq_usd/170):.1f} SOL"   if liq_usd else "?"
+def fetch_pumpfun_trending():
+    """Most actively traded pump.fun coins right now."""
+    coins = []
+    try:
+        r = requests.get(
+            "https://client-api-2-74b1891ee9f9.herokuapp.com/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=true",
+            timeout=15
+        )
+        if r.ok:
+            for c in r.json():
+                coins.append(c)
+            print(f"[PUMP TREND] {len(coins)} coins")
+    except Exception as e:
+        print(f"[PUMP TREND ERR] {e}")
+    return coins
 
-    supply = pair.get("baseToken",{}).get("totalSupply","N/A")
-    if supply and supply != "N/A":
+
+def fetch_pumpfun_about_to_graduate():
+    """Coins close to graduating (high market cap on pump.fun)."""
+    coins = []
+    try:
+        r = requests.get(
+            "https://client-api-2-74b1891ee9f9.herokuapp.com/coins?offset=0&limit=50&sort=market_cap&order=DESC&includeNsfw=true",
+            timeout=15
+        )
+        if r.ok:
+            for c in r.json():
+                usd_mc = c.get("usd_market_cap", 0) or 0
+                if 40_000 <= usd_mc <= 69_000:
+                    coins.append(c)
+            print(f"[PUMP GRAD] {len(coins)} about to graduate")
+    except Exception as e:
+        print(f"[PUMP GRAD ERR] {e}")
+    return coins
+
+
+def fetch_gmgn():
+    """GMGN trending tokens — smart money tracked."""
+    tokens = []
+    try:
+        r = requests.get(
+            "https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=swaps&direction=desc&filters[]=not_wash_trade",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+                "Referer": "https://gmgn.ai/"
+            },
+            timeout=15
+        )
+        if r.ok:
+            data = r.json()
+            rank = data.get("data", {}).get("rank", [])
+            for t in rank[:30]:
+                tokens.append(t)
+            print(f"[GMGN] {len(tokens)} tokens")
+        else:
+            print(f"[GMGN] {r.status_code}")
+    except Exception as e:
+        print(f"[GMGN ERR] {e}")
+    return tokens
+
+
+def fetch_dexscreener_new():
+    """New Solana pairs from DexScreener."""
+    pairs = []
+    seen  = set()
+    for q in ["new solana meme", "solana pump fun"]:
         try:
-            s = float(supply)
-            supply = f"{s/1e9:.0f}B" if s>=1e9 else f"{s/1e6:.0f}M" if s>=1e6 else str(s)
-        except: supply = "1B"  # pump.fun default
+            r = requests.get(
+                f"https://api.dexscreener.com/latest/dex/search/?q={q.replace(' ','+')}",
+                timeout=15
+            )
+            if r.ok:
+                for p in r.json().get("pairs", []):
+                    if p.get("chainId") != "solana": continue
+                    addr = p.get("pairAddress", "")
+                    if addr and addr not in seen:
+                        seen.add(addr)
+                        pairs.append(p)
+        except Exception as e:
+            print(f"[DEX ERR] {e}")
+        time.sleep(0.5)
+    print(f"[DEX] {len(pairs)} pairs")
+    return pairs
 
-    mint_icon   = "✅ Disabled" if rug.get("mint_ok",False)   else "❌ Active"
-    freeze_icon = "✅ Disabled" if rug.get("freeze_ok",False) else "❌ Active"
 
-    meta_label, meta_desc, runner_str = get_narrative(name, ticker, description)
+def fetch_graduated():
+    """Recently graduated pump.fun coins on Raydium."""
+    pairs = []
+    try:
+        r = requests.get(
+            "https://api.dexscreener.com/latest/dex/search/?q=pump+fun+raydium+solana",
+            timeout=15
+        )
+        if r.ok:
+            for p in r.json().get("pairs", []):
+                if p.get("chainId") != "solana": continue
+                # Check if pair is very new (under 10 mins)
+                created = p.get("pairCreatedAt", 0) or 0
+                if created:
+                    mins = int((time.time() - created/1000) / 60)
+                    if mins <= 10:
+                        pairs.append(p)
+    except Exception as e:
+        print(f"[GRAD ERR] {e}")
+    print(f"[GRADUATED] {len(pairs)} recent graduates")
+    return pairs
 
-    twitter, telegram_link, website = check_socials(pair)
-    social_parts = []
-    if twitter:       social_parts.append(f"<a href='{twitter}'>X/Twitter</a>")
-    if telegram_link: social_parts.append(f"<a href='{telegram_link}'>Telegram</a>")
-    if website:       social_parts.append(f"<a href='{website}'>Website</a>")
-    socials_str = " | ".join(social_parts) if social_parts else "No socials ⚠️"
 
-    total_h1 = buys_h1 + sells_h1
-    buy_pct  = f"{int(buys_h1/total_h1*100)}%" if total_h1 > 0 else "?"
-    sell_pct = f"{int(sells_h1/total_h1*100)}%" if total_h1 > 0 else "?"
-    mom_str  = "\n".join(c["mom_signals"][:3]) if c["mom_signals"] else "Early stage — low txn data"
+# ── SCORING ───────────────────────────────────────────────────
+def score_pumpfun_coin(coin):
+    """Score a pump.fun coin. Returns score 0-100 and signals."""
+    score   = 0
+    signals = []
+    risks   = []
 
-    dex_url      = f"https://dexscreener.com/solana/{pair_addr}"
-    rugcheck_url = f"https://rugcheck.xyz/tokens/{token_addr}" if token_addr else "https://rugcheck.xyz"
-    photon_url   = f"https://photon-sol.tinyastro.io/en/lp/{pair_addr}"
-    bundle_url   = f"https://trench.bot/bundles/{token_addr}" if token_addr else "#"
-    pumpfun_url  = f"https://pump.fun/{token_addr}" if token_addr else "#"
+    usd_mc       = coin.get("usd_market_cap", 0) or 0
+    virtual_sol  = coin.get("virtual_sol_reserves", 0) or 0
+    real_sol     = coin.get("real_sol_reserves", 0) or 0
+    reply_count  = coin.get("reply_count", 0) or 0
+    complete     = coin.get("complete", False)
+    twitter      = coin.get("twitter", "")
+    telegram     = coin.get("telegram", "")
+    website      = coin.get("website", "")
+    description  = coin.get("description", "") or ""
+    created_ts   = coin.get("created_timestamp", 0) or 0
+    name         = coin.get("name", "?")
+    symbol       = coin.get("symbol", "?")
 
-    # Description snippet (pump.fun coins have this)
-    desc_str = ""
-    if description and len(description) > 5:
-        desc_str = f"\n📝 <i>{description[:120]}{'...' if len(description)>120 else ''}</i>\n"
+    age_str, age_mins = get_age(created_ts)
 
-    msg = (
-        f"{label}\n"
-        f"{note}"
-        f"<b>{name} | ${ticker}</b>{desc_str}\n"
-        f"📋 <code>{token_addr}</code>\n\n"
+    # Estimate liq from virtual reserves
+    sol_price = 170
+    liq_usd   = (virtual_sol / 1e9) * sol_price if virtual_sol else 0
+
+    # Bonding curve progress (0-100%)
+    bonding_pct = 0
+    if virtual_sol > 0:
+        # pump.fun starts at ~79 SOL virtual, graduation at ~120 SOL
+        bonding_pct = min(100, ((virtual_sol / 1e9) / 120) * 100)
+
+    # ── SCORING ──────────────────────────────────────────────
+
+    # Age scoring — newer = more opportunity
+    if age_mins <= 5:
+        score += 20; signals.append("🆕 Under 5 mins old")
+    elif age_mins <= 15:
+        score += 15; signals.append(f"🆕 {age_mins}m old")
+    elif age_mins <= 30:
+        score += 10; signals.append(f"{age_mins}m old")
+    elif age_mins <= 60:
+        score += 5;  signals.append(f"{age_mins}m old")
+    else:
+        risks.append(f"⏰ {age_str} old")
+
+    # Community engagement
+    if reply_count >= 50:
+        score += 20; signals.append(f"💬 {reply_count} replies 🔥")
+    elif reply_count >= 20:
+        score += 15; signals.append(f"💬 {reply_count} replies")
+    elif reply_count >= 10:
+        score += 10; signals.append(f"💬 {reply_count} replies")
+    elif reply_count >= 5:
+        score += 5;  signals.append(f"💬 {reply_count} replies")
+    else:
+        risks.append(f"💬 Only {reply_count} replies")
+
+    # Bonding curve velocity
+    if bonding_pct >= 80:
+        score += 20; signals.append(f"🌋 {bonding_pct:.0f}% bonding — GRADUATING SOON")
+    elif bonding_pct >= 60:
+        score += 15; signals.append(f"📈 {bonding_pct:.0f}% bonding curve")
+    elif bonding_pct >= 40:
+        score += 10; signals.append(f"📈 {bonding_pct:.0f}% bonding curve")
+    elif bonding_pct >= 20:
+        score += 5;  signals.append(f"{bonding_pct:.0f}% bonding curve")
+
+    # Socials
+    social_count = sum([1 for s in [twitter, telegram, website] if s])
+    if social_count >= 3:
+        score += 15; signals.append("🌐 Full socials ✅")
+    elif social_count == 2:
+        score += 10; signals.append("🌐 2 socials")
+    elif social_count == 1:
+        score += 5;  signals.append("🌐 1 social")
+    else:
+        risks.append("⚠️ No socials")
+
+    # Description quality
+    if len(description) > 50:
+        score += 5; signals.append("📝 Has description")
+
+    # MC scoring
+    if 5_000 <= usd_mc <= 30_000:
+        score += 10; signals.append(f"💰 MC: {fmt(usd_mc)} (sweet spot)")
+    elif usd_mc < 5_000:
+        score += 5; risks.append(f"💰 Very low MC: {fmt(usd_mc)}")
+    else:
+        risks.append(f"💰 MC: {fmt(usd_mc)}")
+
+    return min(score, 100), signals, risks, age_str, age_mins, liq_usd, bonding_pct
+
+
+def score_dex_pair(pair):
+    """Score a DexScreener pair."""
+    score   = 0
+    signals = []
+    risks   = []
+
+    mcap    = pair.get("marketCap", 0) or 0
+    liq_usd = pair.get("liquidity", {}).get("usd", 0) or 0
+    vol_h1  = pair.get("volume", {}).get("h1", 0) or 0
+    ch_h1   = pair.get("priceChange", {}).get("h1", 0) or 0
+    ch_h24  = pair.get("priceChange", {}).get("h24", 0) or 0
+    h1txns  = pair.get("txns", {}).get("h1", {})
+    buys    = h1txns.get("buys",  0)
+    sells   = h1txns.get("sells", 0)
+    total   = buys + sells
+    created = pair.get("pairCreatedAt", 0) or 0
+
+    age_str, age_mins = get_age(created)
+
+    # Liquidity
+    if liq_usd >= 10_000:
+        score += 15; signals.append(f"💧 Liq: {fmt(liq_usd)} ✅")
+    elif liq_usd >= 5_000:
+        score += 10; signals.append(f"💧 Liq: {fmt(liq_usd)}")
+    elif liq_usd >= 2_000:
+        score += 5;  signals.append(f"💧 Liq: {fmt(liq_usd)}")
+    elif liq_usd < 1_000:
+        risks.append(f"⚠️ Very low liq: {fmt(liq_usd)}")
+
+    # Buy pressure
+    if total > 0:
+        ratio = buys / total
+        if ratio >= 0.70:   score += 20; signals.append(f"🟢 Buys {int(ratio*100)}%")
+        elif ratio >= 0.60: score += 15; signals.append(f"🟡 Buys {int(ratio*100)}%")
+        elif ratio >= 0.50: score += 8;  signals.append(f"Buys {int(ratio*100)}%")
+        else:               risks.append(f"🔴 Buys only {int(ratio*100)}%")
+
+    # Tx velocity
+    if total >= 200:   score += 15; signals.append(f"⚡ {total} txns/hr")
+    elif total >= 100: score += 10; signals.append(f"⚡ {total} txns/hr")
+    elif total >= 50:  score += 5;  signals.append(f"{total} txns/hr")
+    elif total >= 20:  score += 2;  signals.append(f"{total} txns/hr")
+
+    # Price action
+    if ch_h1 > 50:    score += 15; signals.append(f"🚀 +{ch_h1:.0f}% 1H")
+    elif ch_h1 > 20:  score += 10; signals.append(f"📈 +{ch_h1:.0f}% 1H")
+    elif ch_h1 > 0:   score += 5;  signals.append(f"+{ch_h1:.0f}% 1H")
+    elif ch_h1 < -30: risks.append(f"📉 {ch_h1:.0f}% 1H")
+
+    # Volume
+    if vol_h1 > 50_000:  score += 15; signals.append(f"💰 ${vol_h1/1000:.0f}K vol/hr")
+    elif vol_h1 > 20_000:score += 10; signals.append(f"💰 ${vol_h1/1000:.0f}K vol/hr")
+    elif vol_h1 > 5_000: score += 5;  signals.append(f"${vol_h1/1000:.0f}K vol/hr")
+
+    # Age bonus
+    if age_mins <= 10:
+        score += 10; signals.append("🆕 Under 10 mins")
+    elif age_mins <= 30:
+        score += 5;  signals.append(f"🆕 {age_mins}m old")
+
+    return min(score, 100), signals, risks, age_str, age_mins, liq_usd, buys, sells
+
+
+def score_gmgn_token(token):
+    """Score a GMGN token."""
+    score   = 0
+    signals = []
+    risks   = []
+
+    swaps_1h     = token.get("swaps_1h",     0) or 0
+    buy_vol_1h   = token.get("buy_volume_1h", 0) or 0
+    sell_vol_1h  = token.get("sell_volume_1h",0) or 0
+    price_change = token.get("price_change_percent", 0) or 0
+    smart_buys   = token.get("smart_buy_24h", 0) or 0
+    mcap         = token.get("market_cap",    0) or 0
+    liq          = token.get("liquidity",     0) or 0
+
+    if smart_buys >= 10:
+        score += 30; signals.append(f"🧠 {smart_buys} smart money buys!")
+    elif smart_buys >= 5:
+        score += 20; signals.append(f"🧠 {smart_buys} smart buys")
+    elif smart_buys >= 2:
+        score += 10; signals.append(f"🧠 {smart_buys} smart buys")
+
+    if swaps_1h >= 500:
+        score += 20; signals.append(f"⚡ {swaps_1h} swaps/hr")
+    elif swaps_1h >= 200:
+        score += 15; signals.append(f"⚡ {swaps_1h} swaps/hr")
+    elif swaps_1h >= 100:
+        score += 10; signals.append(f"{swaps_1h} swaps/hr")
+
+    if price_change > 50:
+        score += 20; signals.append(f"🚀 +{price_change:.0f}%")
+    elif price_change > 20:
+        score += 10; signals.append(f"📈 +{price_change:.0f}%")
+    elif price_change < -30:
+        risks.append(f"📉 {price_change:.0f}%")
+
+    total_vol = buy_vol_1h + sell_vol_1h
+    if total_vol > 0:
+        buy_ratio = buy_vol_1h / total_vol
+        if buy_ratio >= 0.65:
+            score += 15; signals.append(f"🟢 Buy vol {int(buy_ratio*100)}%")
+        elif buy_ratio >= 0.50:
+            score += 8;  signals.append(f"Buy vol {int(buy_ratio*100)}%")
+        else:
+            risks.append(f"Sell pressure {int((1-buy_ratio)*100)}%")
+
+    return min(score, 100), signals, risks, liq
+
+
+# ── RISK LABEL ────────────────────────────────────────────────
+def risk_label(score):
+    if score >= 75: return "🟢 LOW-MED RISK"
+    if score >= 55: return "🟡 MEDIUM RISK"
+    if score >= 35: return "🟠 HIGH RISK"
+    return "🔴 VERY HIGH RISK"
+
+def conviction_label(score):
+    if score >= 80: return "🔴 SEND IT"
+    if score >= 65: return "🟠 LOOKS LIVE"
+    if score >= 50: return "🟡 ON THE RADAR"
+    if score >= 35: return "👀 EARLY RADAR"
+    return "⚪ LOW CONFIDENCE"
+
+def potential_label(score, mc):
+    if score >= 70:
+        return f"🎯 HIGH POTENTIAL\n3x = {fmt(mc*3)} | 5x = {fmt(mc*5)} | 10x = {fmt(mc*10)}"
+    elif score >= 45:
+        return f"🎯 MODERATE POTENTIAL\n3x = {fmt(mc*3)} | 5x = {fmt(mc*5)}"
+    else:
+        return f"🎯 SPECULATIVE\n2x = {fmt(mc*2)} | 3x = {fmt(mc*3)}"
+
+
+# ── BUILD & SEND ──────────────────────────────────────────────
+def send_coin_alert(data):
+    global last_alert_time
+
+    score    = data["score"]
+    name     = data["name"]
+    ticker   = data["ticker"]
+    mc       = data["mc"]
+    liq      = data["liq"]
+    age_str  = data["age_str"]
+    addr     = data["addr"]
+    pair_addr= data["pair_addr"]
+    image    = data.get("image")
+    signals  = data.get("signals", [])
+    risks    = data.get("risks",   [])
+    alert_type = data.get("type", "")
+    description= data.get("description", "")
+    twitter  = data.get("twitter", "")
+    telegram_link = data.get("telegram", "")
+    website  = data.get("website", "")
+    bonding  = data.get("bonding_pct", 0)
+    price    = data.get("price", "N/A")
+    supply   = data.get("supply", "1B")
+    buys     = data.get("buys", 0)
+    sells    = data.get("sells", 0)
+
+    conv  = conviction_label(score)
+    risk  = risk_label(score)
+    pot   = potential_label(score, mc)
+
+    # Social links
+    socials = []
+    if twitter:       socials.append(f"<a href='{twitter}'>Twitter</a>")
+    if telegram_link: socials.append(f"<a href='{telegram_link}'>Telegram</a>")
+    if website:       socials.append(f"<a href='{website}'>Website</a>")
+    soc_str = " | ".join(socials) if socials else "None ⚠️"
+
+    # Signal/risk display
+    sig_str  = "\n".join(signals[:4]) if signals else "—"
+    risk_str = "\n".join(risks[:2])   if risks   else "—"
+
+    # Type badge
+    type_badge = {
+        "new":      "🆕 JUST LAUNCHED",
+        "trending": "🔥 TRENDING",
+        "graduate": "🌋 ABOUT TO MIGRATE",
+        "migrated": "⚡ JUST MIGRATED TO RAYDIUM",
+        "gmgn":     "🧠 SMART MONEY ALERT",
+        "dex":      "📊 DEX SCANNER",
+        "forced":   "🔎 BEST AVAILABLE",
+    }.get(alert_type, "📡 SCAN")
+
+    # Short caption for image (under 1024 chars)
+    short_cap = (
+        f"{type_badge}\n"
+        f"{conv} — {score}/100 | {risk}\n\n"
+        f"<b>{name} | ${ticker}</b>\n"
+        f"MC: {fmt(mc)} | Liq: {fmt(liq)} | Age: {age_str}\n"
+        f"Price: {price}\n\n"
+        f"{sig_str}"
+    )
+
+    # Full analysis as follow-up text
+    bonding_str = f"🌋 Bonding: {bonding:.0f}%\n" if bonding > 0 else ""
+    desc_str    = f"📝 {description[:100]}...\n\n" if len(description) > 20 else ""
+    buysell_str = f"Buys: {buys} | Sells: {sells}\n" if buys or sells else ""
+
+    dex_url     = f"https://dexscreener.com/solana/{pair_addr}"
+    pump_url    = f"https://pump.fun/{addr}"
+    rug_url     = f"https://rugcheck.xyz/tokens/{addr}"
+    photon_url  = f"https://photon-sol.tinyastro.io/en/lp/{pair_addr}"
+    bundle_url  = f"https://trench.bot/bundles/{addr}"
+
+    full_msg = (
+        f"{type_badge} — <b>{score}/100</b>\n"
+        f"{conv} | {risk}\n\n"
+        f"<b>{name} | ${ticker}</b>\n"
+        f"{desc_str}"
+        f"📋 <code>{addr}</code>\n\n"
         f"📦 Supply: {supply}\n"
-        f"📊 MC: {fmt(mcap)}\n"
-        f"💧 Liq: {liq_sol} | {fmt(liq_usd)} ({liq_pct})\n"
-        f"🕐 Age: {c['age_str']}\n"
-        f"💲 Price: {price_str}\n\n"
-        f"📈 <b>MOMENTUM</b>\n"
-        f"{mom_str}\n"
-        f"Buys: {buys_h1} ({buy_pct}) | Sells: {sells_h1} ({sell_pct})\n"
-        f"Vol 1H: {fmt(vol_h1)} | 24H: {fmt(vol_h24)}\n"
-        f"1H: {'+' if ch_h1>=0 else ''}{ch_h1:.0f}% | 24H: {'+' if ch_h24>=0 else ''}{ch_h24:.0f}%\n\n"
-        f"❄️ FREEZE: {freeze_icon}\n"
-        f"🪙 MINT: {mint_icon}\n\n"
-        f"🎯 <b>NARRATIVE: {meta_label}</b>\n"
-        f"{meta_desc}\n"
-        + (f"📊 {runner_str}\n" if runner_str else "")
-        + f"\n🌐 {socials_str}\n\n"
-        f"💰 <b>TARGETS</b>\n"
-        f"3x = {fmt(mcap*3)} MC\n"
-        f"10x = {fmt(mcap*10)} MC\n\n"
+        f"📊 MC: {fmt(mc)}\n"
+        f"💧 Liq: {fmt(liq)}\n"
+        f"🕐 Age: {age_str}\n"
+        f"💲 Price: {price}\n"
+        f"{bonding_str}\n"
+        f"✅ <b>SIGNALS</b>\n{sig_str}\n\n"
+        f"⚠️ <b>RISKS</b>\n{risk_str}\n\n"
+        f"{buysell_str}"
+        f"🌐 {soc_str}\n\n"
+        f"{pot}\n\n"
         f"🔗 <a href='{dex_url}'>DEX</a> | "
-        f"<a href='{pumpfun_url}'>PUMP</a> | "
-        f"<a href='{rugcheck_url}'>RUG</a> | "
+        f"<a href='{pump_url}'>PUMP</a> | "
+        f"<a href='{rug_url}'>RUG</a> | "
         f"<a href='{photon_url}'>PHOTON</a> | "
         f"<a href='{bundle_url}'>BUNDLE</a>\n\n"
-        f"<i>NFA — DYOR — could go zero</i>\n"
-        f"<i>⏱ Updates at 10m/30m/1hr</i>"
+        f"<i>NFA — DYOR — 99% go zero</i>\n"
+        f"<i>📊 Reply if 1.5x+ at 10m/30m/1hr</i>"
     )
-    return msg
 
+    # Send
+    msg_id = None
+    if image:
+        msg_id = send_photo(image, short_cap)
+        if msg_id:
+            time.sleep(0.3)
+            send_text(full_msg, reply_to=msg_id)
+    if not msg_id:
+        msg_id = send_text(full_msg)
 
-def send_alert(c, label, note="", forced=False):
-    global last_forced_alert
-    pair_addr  = c["pair_addr"]
-    token_addr = c["token_addr"]
-    image_url  = c.get("image_url")
-
-    msg = build_message(c, label, note)
-
-    if image_url:
-        message_id = send_telegram_photo(image_url, msg)
-    else:
-        message_id = send_telegram(msg)
-
+    # Track
     alerted.add(pair_addr)
+    alerted.add(addr)
     save_alerted(pair_addr)
-    if forced:
-        last_forced_alert = time.time()
+    save_alerted(addr)
+    last_alert_time = time.time()
 
-    if message_id:
+    if msg_id:
         tracked[pair_addr] = {
-            "ticker": c["ticker"], "name": c["name"],
-            "entry_mcap": c["mcap"], "entry_price": c["pair"].get("priceUsd","0"),
-            "token_addr": token_addr,
-            "alerted_at": time.time(),
-            "message_id": message_id,
-            "updates_sent": 0,
+            "ticker":     ticker,
+            "entry_mcap": mc,
+            "message_id": msg_id,
         }
         schedule_updates(pair_addr)
 
-    print(f"[ALERT{'*FORCED*' if forced else ''}] {c['ticker']} score {c['score']}")
-
-
-# ── PROCESS PAIR INTO CANDIDATE ───────────────────────────────
-def process_pair(pair, source="dex"):
-    pair_addr  = pair.get("pairAddress","")
-    token_addr = pair.get("baseToken",{}).get("address","")
-    ticker     = pair.get("baseToken",{}).get("symbol","?")
-    name       = pair.get("baseToken",{}).get("name","?")
-    description= pair.get("_description","")
-    image_url  = pair.get("_image", None)
-
-    if pair_addr in alerted: return None
-    BLOCKED = ["define", "memecoins", "test", "scam"]
-    if any(b in name.lower() or b in ticker.lower() for b in BLOCKED):
-        return None
-
-    mcap = pair.get("marketCap",0) or pair.get("fdv",0) or 0
-    if mcap <= 0: return None
-
-    age_str, age_mins = get_age(pair)
-    if age_mins > 1440: return None
-
-    liq_score, liq_usd = score_liquidity(pair)
-    if liq_score == -999: return None
-
-    mom_score, mom_signals, buys_h1, sells_h1 = score_momentum(pair)
-    narr_score  = score_narrative_num(name, ticker, description)
-    total_score = liq_score + mom_score + narr_score
-
-    rug = get_rugcheck(token_addr) if token_addr and total_score >= 30 else {}
-
-    return {
-        "pair": pair, "score": total_score,
-        "mom_signals": mom_signals, "age_str": age_str, "age_mins": age_mins,
-        "mcap": mcap, "liq_usd": liq_usd,
-        "ticker": ticker, "name": name, "description": description,
-        "pair_addr": pair_addr, "token_addr": token_addr,
-        "buys_h1": buys_h1, "sells_h1": sells_h1, "rug": rug,
-        "image_url": image_url, "source": source,
-        "complete": pair.get("_complete", False),
-        "raydium": pair.get("_raydium", None),
-    }
+    print(f"[SENT] {ticker} {score}/100 [{alert_type}]")
+    return msg_id
 
 
 # ── MAIN SCAN ─────────────────────────────────────────────────
-def scan_and_alert():
-    global last_forced_alert
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔍 Scanning all sources...")
+def scan():
+    global last_alert_time
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scanning...")
 
-    # Fetch from all sources
-    type1_candidates = []  # under $30K MC
-    type2_candidates = []  # about to migrate $50K-$69K
-    type3_candidates = []  # just migrated to Raydium (first 5 mins)
-    all_candidates   = []  # everything with any score
+    all_coins = []  # (score, data_dict)
 
-    # Pump.fun
-    pump_coins = fetch_pumpfun()
-    for _, coin in pump_coins:
-        pair = normalise_pumpfun(coin)
-        if not pair: continue
-        if pair.get("chainId") != "solana": continue
+    # ── PUMP.FUN NEW ──────────────────────────────────────────
+    for coin in fetch_pumpfun_new():
+        name   = coin.get("name",   "?")
+        ticker = coin.get("symbol", "?")
+        mint   = coin.get("mint",   "")
+        if not mint or mint in alerted: continue
+        if is_blocked(name, ticker):    continue
 
-        c = process_pair(pair, "pumpfun")
-        if not c: continue
+        score, signals, risks, age_str, age_mins, liq_usd, bonding = score_pumpfun_coin(coin)
+        mc = coin.get("usd_market_cap", 0) or 0
 
-        mcap      = c["mcap"]
-        complete  = c["complete"]
-        raydium   = c["raydium"]
-        age_mins  = c["age_mins"]
+        price_raw = coin.get("price", 0) or 0
+        try:    price_str = f"${float(price_raw):.8f}"
+        except: price_str = "N/A"
 
-        all_candidates.append(c)
+        data = {
+            "score": score, "name": name, "ticker": ticker,
+            "mc": mc, "liq": liq_usd, "age_str": age_str,
+            "addr": mint, "pair_addr": mint,
+            "image": coin.get("image_uri"),
+            "signals": signals, "risks": risks,
+            "type": "new" if age_mins <= 10 else "trending",
+            "description": coin.get("description",""),
+            "twitter":  coin.get("twitter",""),
+            "telegram": coin.get("telegram",""),
+            "website":  coin.get("website",""),
+            "bonding_pct": bonding,
+            "price": price_str, "supply": "1B",
+            "buys": 0, "sells": 0,
+        }
+        all_coins.append((score, data))
 
-        # Type 3 — just migrated to Raydium, first 5 mins
-        if complete and raydium and age_mins <= TYPE3_MAX_MINS:
-            type3_candidates.append(c)
-        # Type 2 — about to migrate
-        elif TYPE2_MIN_MC <= mcap <= TYPE2_MAX_MC:
-            type2_candidates.append(c)
-        # Type 1 — fresh under $30K
-        elif mcap <= TYPE1_MAX_MC and c["score"] >= 25:
-            type1_candidates.append(c)
+    # ── PUMP.FUN ABOUT TO GRADUATE ────────────────────────────
+    for coin in fetch_pumpfun_about_to_graduate():
+        name   = coin.get("name",   "?")
+        ticker = coin.get("symbol", "?")
+        mint   = coin.get("mint",   "")
+        if not mint or mint in alerted: continue
+        if is_blocked(name, ticker):    continue
 
-    # DexScreener + GeckoTerminal
-    dex_pairs   = fetch_dexscreener()
-    gecko_pairs = fetch_geckoterminal()
+        score, signals, risks, age_str, age_mins, liq_usd, bonding = score_pumpfun_coin(coin)
+        score = min(100, score + 20)  # Bonus for being near graduation
+        mc    = coin.get("usd_market_cap", 0) or 0
 
-    seen_addrs = set()
-    for source, pair in dex_pairs + gecko_pairs:
-        if pair.get("chainId") != "solana": continue
-        addr = pair.get("pairAddress","")
-        if addr in seen_addrs: continue
-        seen_addrs.add(addr)
+        data = {
+            "score": score, "name": name, "ticker": ticker,
+            "mc": mc, "liq": liq_usd, "age_str": age_str,
+            "addr": mint, "pair_addr": mint,
+            "image": coin.get("image_uri"),
+            "signals": [f"🌋 {bonding:.0f}% bonding curve — GRADUATING SOON"] + signals,
+            "risks": risks, "type": "graduate",
+            "description": coin.get("description",""),
+            "twitter":  coin.get("twitter",""),
+            "telegram": coin.get("telegram",""),
+            "website":  coin.get("website",""),
+            "bonding_pct": bonding,
+            "price": "N/A", "supply": "1B",
+            "buys": 0, "sells": 0,
+        }
+        all_coins.append((score, data))
 
-        c = process_pair(pair, source)
-        if not c: continue
+    # ── GMGN SMART MONEY ──────────────────────────────────────
+    for token in fetch_gmgn():
+        addr   = token.get("address", "")
+        name   = token.get("name",    "?")
+        ticker = token.get("symbol",  "?")
+        if not addr or addr in alerted: continue
+        if is_blocked(name, ticker):    continue
 
-        all_candidates.append(c)
-        if c["mcap"] <= TYPE1_MAX_MC and c["score"] >= 25:
-            type1_candidates.append(c)
+        mc  = token.get("market_cap", 0) or 0
+        if mc > 500_000: continue  # Skip large caps
 
-    # Sort each tier by score
-    type3_candidates.sort(key=lambda x: x["score"], reverse=True)
-    type2_candidates.sort(key=lambda x: x["score"], reverse=True)
-    type1_candidates.sort(key=lambda x: x["score"], reverse=True)
-    all_candidates.sort(key=lambda x: x["score"],   reverse=True)
+        score, signals, risks, liq = score_gmgn_token(token)
+        price_raw = token.get("price", 0) or 0
+        try:    price_str = f"${float(price_raw):.8f}"
+        except: price_str = "N/A"
 
-    print(f"[SCAN] Type1:{len(type1_candidates)} Type2:{len(type2_candidates)} Type3:{len(type3_candidates)}")
+        data = {
+            "score": score, "name": name, "ticker": ticker,
+            "mc": mc, "liq": liq, "age_str": "N/A",
+            "addr": addr, "pair_addr": addr,
+            "image": token.get("logo", None),
+            "signals": signals, "risks": risks,
+            "type": "gmgn",
+            "description": "",
+            "twitter": "", "telegram": "", "website": "",
+            "bonding_pct": 0,
+            "price": price_str, "supply": "N/A",
+            "buys": 0, "sells": 0,
+        }
+        all_coins.append((score, data))
+
+    # ── DEXSCREENER ───────────────────────────────────────────
+    for pair in fetch_dexscreener_new():
+        pair_addr = pair.get("pairAddress", "")
+        addr      = pair.get("baseToken", {}).get("address", "")
+        name      = pair.get("baseToken", {}).get("name",    "?")
+        ticker    = pair.get("baseToken", {}).get("symbol",  "?")
+        if not pair_addr or pair_addr in alerted: continue
+        if is_blocked(name, ticker):               continue
+
+        mc = pair.get("marketCap", 0) or 0
+        if mc > 200_000: continue
+
+        score, signals, risks, age_str, age_mins, liq_usd, buys, sells = score_dex_pair(pair)
+        price_raw = pair.get("priceUsd", "0") or "0"
+        try:    price_str = f"${float(price_raw):.8f}"
+        except: price_str = "N/A"
+
+        # check socials from info
+        info      = pair.get("info", {})
+        twitter   = next((s.get("url","") for s in info.get("socials",[]) if "twitter" in s.get("type","").lower()), "")
+        telegram  = next((s.get("url","") for s in info.get("socials",[]) if "telegram" in s.get("type","").lower()), "")
+        website   = info.get("websites",[{}])[0].get("url","") if info.get("websites") else ""
+
+        alert_type = "migrated" if age_mins <= 10 else "dex"
+
+        data = {
+            "score": score, "name": name, "ticker": ticker,
+            "mc": mc, "liq": liq_usd, "age_str": age_str,
+            "addr": addr, "pair_addr": pair_addr,
+            "image": info.get("imageUrl", None),
+            "signals": signals, "risks": risks,
+            "type": alert_type,
+            "description": "",
+            "twitter": twitter, "telegram": telegram, "website": website,
+            "bonding_pct": 0,
+            "price": price_str, "supply": "N/A",
+            "buys": buys, "sells": sells,
+        }
+        all_coins.append((score, data))
+
+    # ── SORT & SEND ───────────────────────────────────────────
+    all_coins.sort(key=lambda x: x[0], reverse=True)
+    print(f"[SCAN] {len(all_coins)} candidates total")
 
     sent = 0
 
-    # TYPE 3 — Just migrated (highest priority, always send)
-    for c in type3_candidates[:2]:
-        send_alert(c,
-            label="🔥🔥 JUST MIGRATED TO RAYDIUM — FIRST 5 MINS",
-            note="⚡ <b>Migration alert — this just hit Raydium. Window is NOW.</b>\n\n"
-        )
+    # Send top coins that score 40+
+    for score, data in all_coins:
+        if sent >= 3: break  # Max 3 per scan
+        if score < 40: break
+        pair_addr = data["pair_addr"]
+        addr      = data["addr"]
+        if pair_addr in alerted or addr in alerted: continue
+        send_coin_alert(data)
         sent += 1
         time.sleep(1)
 
-    # TYPE 2 — About to migrate
-    for c in type2_candidates[:2]:
-        if c["score"] >= 20:
-            send_alert(c,
-                label=f"🌋 ABOUT TO MIGRATE — {fmt(c['mcap'])} MC",
-                note="🔔 <b>Bonding curve nearly full. Migration to Raydium imminent.</b>\n\n"
-            )
-            sent += 1
-            time.sleep(1)
-
-    # TYPE 1 — Fresh coins under $30K with good score
-    for c in type1_candidates[:3]:
-        if c["score"] >= 45:
-            if c["score"] >= 85:   label = "🔴 SEND IT"
-            elif c["score"] >= 75: label = "🟠 LOOKS LIVE"
-            elif c["score"] >= 60: label = "🟡 ON THE RADAR"
-            else:                  label = "👀 EARLY RADAR"
-            send_alert(c, label=label)
-            sent += 1
-            time.sleep(1)
-
-    # BEST AVAILABLE — if nothing sent and 10 mins passed
+    # If nothing sent and 2+ mins since last alert, send best available (any score)
     if sent == 0:
-        time_since = time.time() - last_forced_alert
-        top_candidates = [c for c in all_candidates if c["score"] >= 20]
-        if time_since >= BEST_AVAILABLE_EVERY and top_candidates:
-            best = top_candidates[0]
-            send_alert(best,
-                label=f"🔎 BEST AVAILABLE — {best['score']}/100",
-                note="⚠️ <i>No high conviction coins — best of current market. Lower confidence.</i>\n\n",
-                forced=True
-            )
-            sent += 1
+        time_since = time.time() - last_alert_time
+        if time_since >= SCAN_INTERVAL and all_coins:
+            # Find best non-alerted coin regardless of score
+            for score, data in all_coins:
+                pair_addr = data["pair_addr"]
+                addr      = data["addr"]
+                if pair_addr in alerted or addr in alerted: continue
+                data["type"] = "forced"
+                send_coin_alert(data)
+                sent += 1
+                break
 
     if sent == 0:
-        print("[SCAN] Nothing to send this round")
+        print("[SCAN] Nothing to send")
     else:
-        print(f"[SCAN] {sent} alert(s) sent")
+        print(f"[SCAN] Sent {sent}")
 
 
-def send_startup():
-    send_telegram(
+# ── STARTUP ───────────────────────────────────────────────────
+def startup():
+    send_text(
         "🤖 <b>CHAINSCAN BOT ONLINE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Sources: Pump.fun + DexScreener + GeckoTerminal\n"
-        "🟢 Type 1: Fresh coins under $30K MC\n"
-        "🌋 Type 2: About to migrate ($50K-$69K)\n"
-        "🔥 Type 3: Just migrated to Raydium (5 min window)\n"
-        "Scan: Every 2 mins\n"
-        "Updates: replies at 10m/30m/1hr\n"
+        "Sources: Pump.fun + GMGN + DexScreener\n"
+        "🆕 New launches scored live\n"
+        "🧠 Smart money tracking (GMGN)\n"
+        "🌋 Pre-migration alerts\n"
+        "⚡ Post-migration (first 5 mins)\n"
+        "📊 Every score shown — high & low risk\n"
+        "💬 Replies ONLY if 1.5x+\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🟢 Bot is live. Alerts incoming."
+        "🟢 Live. Alerts every 2 mins."
     )
 
 
 if __name__ == "__main__":
     print("="*50)
-    print("  CHAINSCAN — Solana Meme Coin Scanner")
+    print("  CHAINSCAN — Solana Scanner")
     print("="*50)
-    send_startup()
+    startup()
     while True:
         try:
-            scan_and_alert()
+            scan()
         except Exception as e:
-            print(f"[MAIN ERROR] {e}")
-        print(f"[SLEEP] {SCAN_INTERVAL}s...")
+            print(f"[MAIN ERR] {e}")
+        print(f"[SLEEP] {SCAN_INTERVAL}s")
         time.sleep(SCAN_INTERVAL)
